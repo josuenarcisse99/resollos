@@ -7,6 +7,7 @@ import { uploadAsset } from "./services/storage";
 import { syncUserState } from "./services/sync";
 import EmailIntelligence from "./components/EmailIntelligence";
 import ReportsPage from "./components/ReportsPage";
+import NikeSwooshPolicyMonitor from "./components/NikeSwooshPolicyMonitor";
 
 const STORAGE_KEYS = {
   inventory: "resellos-inventory",
@@ -353,6 +354,7 @@ function getRouteFromLocation() {
     "gmail-integration": { page: "email-intelligence", section: "gmail" },
     financials: { page: "financials", section: null },
     reports: { page: "reports", section: null },
+    "nike-swoosh-monitor": { page: "nike-swoosh-monitor", section: null },
     "ai-tools": { page: "ai-tools", section: null },
   };
 
@@ -1218,6 +1220,7 @@ function AppShell() {
     { id: "email-intelligence", section: "gmail", label: "📬 Gmail Integration" },
     { id: "financials", section: null, label: "💰 Financial & Tax" },
     { id: "reports", section: null, label: "📊 Reports" },
+    { id: "nike-swoosh-monitor", section: null, label: "🧭 Nike & Swoosh Monitor" },
     { id: "ai-tools", section: null, label: "🤖 AI Tools" },
   ];
 
@@ -1481,6 +1484,8 @@ function AppShell() {
             returns={returns}
           />
         )}
+
+        {page === "nike-swoosh-monitor" && <NikeSwooshPolicyMonitor />}
 
         {page === "ai-inbox" && (
           <AIInboxPage
