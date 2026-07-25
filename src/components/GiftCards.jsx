@@ -218,7 +218,7 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
   const [importReviewItems, setImportReviewItems] = useState([]);
   const [showImportReview, setShowImportReview] = useState(false);
   const [reviewDrafts, setReviewDrafts] = useState({});
-  const [activeTab, setActiveTab] = useState("dashboard");
+  const [activeTab, setActiveTab] = useState("imports");
   const [showSensitiveInfo, setShowSensitiveInfo] = useState(false);
   const [toast, setToast] = useState("");
   const [theme, setTheme] = useState("dark");
@@ -378,7 +378,7 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
   const selectedCard = normalizedGiftCards.find((card) => card.id === detailCardId) || null;
   const selectedPurchaseOrder = purchaseCenterItems.find((order) => order.id === selectedPurchaseOrderId) || null;
 
-  const section = activeSection || "main";
+  const section = activeSection || "imports";
   const resolvedTab = section && ["dashboard", "cards", "imports", "purchases", "analytics", "settings"].includes(section) ? section : activeTab;
 
   const showPurchaseCenter = resolvedTab === "imports";
@@ -950,27 +950,10 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
           <h1 style={{ margin: 0, fontSize: "30px" }}>Gift Card Command Center</h1>
           <p style={{ margin: "6px 0 0", color: "#6b7280" }}>AI-assisted inventory, OCR review, import automation, and mobile-first operations in one premium workspace.</p>
         </div>
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-          <button onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))} style={{ padding: "10px 12px", borderRadius: "999px", border: "1px solid #e5e7eb", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>
-            {theme === "dark" ? "☀️ Light" : "🌙 Dark"}
-          </button>
-          <button onClick={() => setShowImportMenu((current) => !current)} style={{ padding: "12px 16px", borderRadius: "999px", border: "none", background: "linear-gradient(135deg, #2563eb, #14b8a6)", color: "#fff", fontWeight: 800, cursor: "pointer" }}>➕ Import Gift Cards</button>
-        </div>
+        <button onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))} style={{ padding: "10px 12px", borderRadius: "999px", border: "1px solid #e5e7eb", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>
+          {theme === "dark" ? "☀️ Light" : "🌙 Dark"}
+        </button>
       </div>
-
-      {showImportMenu && (
-        <div style={{ border: "1px solid rgba(255,255,255,0.14)", background: theme === "dark" ? "rgba(17,24,39,0.95)" : "rgba(255,255,255,0.9)", borderRadius: "18px", padding: "14px", marginBottom: "16px", boxShadow: "0 10px 40px rgba(0,0,0,0.12)" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "10px" }}>
-            <button onClick={() => { setImportAccept("image/*;capture=camera"); fileInputRef.current?.click(); }} style={{ padding: "12px", borderRadius: "12px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📷 Take Photo</button>
-            <button onClick={() => { setImportAccept("image/*"); fileInputRef.current?.click(); }} style={{ padding: "12px", borderRadius: "12px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>🖼 Upload Screenshot(s)</button>
-            <button onClick={() => { setImportAccept(".pdf"); fileInputRef.current?.click(); }} style={{ padding: "12px", borderRadius: "12px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📄 Upload PDF</button>
-            <button onClick={() => importFromUrl()} style={{ padding: "12px", borderRadius: "12px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>🌐 Import From Website URL</button>
-            <button onClick={() => setShowImportMenu(false)} style={{ padding: "12px", borderRadius: "12px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📋 Paste Image</button>
-            <button onClick={() => { setImportAccept(".csv,text/csv"); fileInputRef.current?.click(); }} style={{ padding: "12px", borderRadius: "12px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📊 Upload CSV</button>
-          </div>
-          <input ref={fileInputRef} type="file" accept={importAccept} multiple hidden onChange={handleUpload} />
-        </div>
-      )}
 
       {importQueue.length > 0 && (
         <div style={{ marginBottom: "16px", borderRadius: "16px", padding: "14px", background: theme === "dark" ? "rgba(15,23,42,0.95)" : "rgba(255,255,255,0.95)", border: "1px solid #e5e7eb" }}>

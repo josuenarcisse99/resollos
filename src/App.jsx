@@ -1414,7 +1414,7 @@ function AppShell() {
             giftCards={giftCards}
             setGiftCards={setGiftCards}
             onGiftCardPurchase={handleGiftCardPurchase}
-            activeSection={routeSection}
+            activeSection={routeSection || "imports"}
           />
         )}
 
