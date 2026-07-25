@@ -6,6 +6,7 @@ import { calculateReminderDate, getExpirationDate, getReminderStatus, maskCardNu
 const STORAGE_KEY = "resellos-gift-cards";
 const SUPPLIER_STORAGE_KEY = "resellos-gift-card-suppliers";
 const PURCHASE_STORAGE_KEY = "resellos-gift-card-purchases";
+const IMPORT_HISTORY_STORAGE_KEY = "resellos-gift-card-import-history";
 
 const STATUS_ORDER = ["New", "Active", "Needs Review", "Partially Used", "Used", "Empty", "Archived"];
 const STATUS_META = {
@@ -173,8 +174,73 @@ function createCardFromMetadata(metadata = {}, context = {}) {
     linkedInvoice: metadata.linkedInvoice || "",
     linkedInventory: metadata.linkedInventory || "",
     linkedExpenses: metadata.linkedExpenses || "",
+    linkedPurchaseOrder: metadata.linkedPurchaseOrder || context.linkedPurchaseOrder || "",
+    purchaseOrderId: metadata.purchaseOrderId || context.purchaseOrderId || "",
     history: [{ label: "Imported", timestamp: new Date().toISOString(), detail: context.sourceName || "Imported" }],
   };
+}
+
+function detectCurrency(text = "") {
+  const haystack = String(text || "").toLowerCase();
+  if (haystack.includes("eur") || haystack.includes("€")) return "EUR";
+  if (haystack.includes("gbp") || haystack.includes("£")) return "GBP";
+  if (haystack.includes("cad") || haystack.includes("c$")) return "CAD";
+  if (haystack.includes("aud") || haystack.includes("a$")) return "AUD";
+  return "USD";
+}
+
+function extractAmountValue(text = "", patterns = []) {
+  for (const pattern of patterns) {
+    const match = String(text || "").match(pattern);
+    if (match) {
+      const raw = match[1] || match[2] || "";
+      return Number(String(raw).replace(/[^0-9.]/g, "")) || 0;
+    }
+  }
+  return 0;
+}
+
+function parseReceiptDetails(text = "") {
+  const rawText = String(text || "");
+  const supplier = rawText.match(/supplier[:\s]+([A-Za-z0-9 &.-]+)/i)?.[1] || rawText.match(/merchant[:\s]+([A-Za-z0-9 &.-]+)/i)?.[1] || "";
+  const orderNumber = rawText.match(/order(?:\s*number|\s*id)?[:#\s-]*([A-Za-z0-9-]+)/i)?.[1] || "";
+  const purchaseDate = rawText.match(/(?:purchase date|purchased on|date)[:\s]*([A-Za-z0-9,\/-]+)/i)?.[1] || "";
+  const invoiceNumber = rawText.match(/invoice(?:\s*number)?[:#\s-]*([A-Za-z0-9-]+)/i)?.[1] || "";
+  const totalPaid = extractAmountValue(rawText, [/total(?:\s+paid)?[:\s$]*([0-9,.]+)/i, /amount due[:\s$]*([0-9,.]+)/i, /total[:\s$]*([0-9,.]+)/i]);
+  const taxes = extractAmountValue(rawText, [/tax(?:es)?[:\s$]*([0-9,.]+)/i]);
+  const fees = extractAmountValue(rawText, [/fees[:\s$]*([0-9,.]+)/i, /service fee[:\s$]*([0-9,.]+)/i]);
+  const discounts = extractAmountValue(rawText, [/discount[:\s$]*([0-9,.]+)/i]);
+  const currency = detectCurrency(rawText);
+
+  return {
+    supplier,
+    orderNumber,
+    purchaseDate,
+    invoiceNumber,
+    totalPaid,
+    taxes,
+    fees,
+    discounts,
+    currency,
+  };
+}
+
+function parseGiftCardRows(text = "") {
+  const rows = parseCsv(text || "");
+  return rows
+    .map((row) => ({
+      merchant: row.merchant || row.brand || row.supplier || "Card Depot",
+      brand: row.brand || row.merchant || row.supplier || "Card Depot",
+      supplier: "CardDepot",
+      cardNumber: row.cardnumber || row.cardnumbervalue || row.cardno || row.card || "",
+      pin: row.pin || row.code || row.pincode || "",
+      faceValue: parseNumber(row.facevalue || row.facevaluein || row.value || row.amount || row["face value"] || 0),
+      balance: parseNumber(row.balance || row.currentbalance || row.facevalue || row.facevaluein || row.value || 0) || parseNumber(row.facevalue || row.facevaluein || row.value || row.amount || 0),
+      purchasePrice: parseNumber(row.purchaseprice || row.cost || row.price || row.facevalue || row.facevaluein || row.value || 0),
+      purchaseDate: row.purchasedate || row.purchasedon || row.date || "",
+      currency: detectCurrency(text),
+    }))
+    .filter((row) => row.cardNumber || row.pin || row.faceValue || row.merchant || row.brand);
 }
 
 export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards: setControlledGiftCards, onGiftCardPurchase, activeSection = null }) {
@@ -202,6 +268,10 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
   const [toast, setToast] = useState("");
   const [theme, setTheme] = useState("dark");
   const [visibleCount, setVisibleCount] = useState(24);
+  const [giftCardPasteText, setGiftCardPasteText] = useState("");
+  const [receiptPasteText, setReceiptPasteText] = useState("");
+  const [importHistory, setImportHistory] = useState(() => loadStored(IMPORT_HISTORY_STORAGE_KEY, []));
+  const [selectedPurchaseOrderId, setSelectedPurchaseOrderId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
   const [importAccept, setImportAccept] = useState(".pdf,.png,.jpg,.jpeg,.webp,.gif,.csv,.txt");
   const fileInputRef = useRef(null);
@@ -269,6 +339,10 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
   }, [purchaseCenterItems]);
 
   useEffect(() => {
+    saveStored(IMPORT_HISTORY_STORAGE_KEY, importHistory);
+  }, [importHistory]);
+
+  useEffect(() => {
     if (!toast) return undefined;
     const timer = window.setTimeout(() => setToast(""), 2500);
     return () => window.clearTimeout(timer);
@@ -334,17 +408,19 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
   const sourceOptions = useMemo(() => ["All", ...Array.from(new Set(normalizedGiftCards.map((card) => card.sourceType).filter(Boolean)))], [normalizedGiftCards]);
   const tagOptions = useMemo(() => ["All", ...Array.from(new Set(normalizedGiftCards.flatMap((card) => card.tags || []).filter(Boolean)))], [normalizedGiftCards]);
   const selectedCard = normalizedGiftCards.find((card) => card.id === detailCardId) || null;
+  const selectedPurchaseOrder = purchaseCenterItems.find((order) => order.id === selectedPurchaseOrderId) || null;
 
   const section = activeSection || "main";
-  const resolvedTab = section && ["dashboard", "cards", "imports", "analytics", "settings"].includes(section) ? section : activeTab;
+  const resolvedTab = section && ["dashboard", "cards", "imports", "purchases", "analytics", "settings"].includes(section) ? section : activeTab;
 
-  const showPurchaseCenter = resolvedTab === "imports" || resolvedTab === "dashboard";
+  const showPurchaseCenter = resolvedTab === "imports";
   const showReviewQueue = resolvedTab === "dashboard" || resolvedTab === "cards";
 
   const tabOptions = [
     { id: "dashboard", label: "Dashboard" },
     { id: "cards", label: "Inventory" },
     { id: "imports", label: "Import" },
+    { id: "purchases", label: "Purchase Orders" },
     { id: "analytics", label: "Analytics" },
     { id: "settings", label: "Settings" },
   ];
@@ -453,6 +529,107 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
       cards,
       sourceName: file.name,
     };
+  }
+
+  function buildPasteImportPlan() {
+    const cards = parseGiftCardRows(giftCardPasteText).map((row, index) => createCardFromMetadata({
+      merchant: row.merchant,
+      brand: row.brand,
+      supplier: row.supplier,
+      faceValue: row.faceValue,
+      balance: row.balance,
+      purchasePrice: row.purchasePrice,
+      cardNumber: row.cardNumber,
+      pin: row.pin,
+      purchaseDate: row.purchaseDate,
+      currency: row.currency,
+      status: "New",
+      reviewRequired: false,
+      notes: `Imported from pasted CSV row ${index + 1}`,
+      linkedPurchaseOrder: "",
+      sourceType: "paste-csv",
+      sourceName: "Paste import",
+    }, {
+      id: createId("gift-card"),
+      sourceName: "Paste import",
+      sourceType: "paste-csv",
+      linkedPurchaseOrder: "",
+    }));
+
+    const receiptDetails = parseReceiptDetails(receiptPasteText);
+    const purchaseOrder = {
+      id: createId("purchase-order"),
+      supplier: receiptDetails.supplier || "CardDepot",
+      orderId: receiptDetails.orderNumber || "",
+      purchaseDate: receiptDetails.purchaseDate || "",
+      date: receiptDetails.purchaseDate || new Date().toISOString().slice(0, 10),
+      totalCost: receiptDetails.totalPaid || 0,
+      taxes: receiptDetails.taxes || 0,
+      fees: receiptDetails.fees || 0,
+      discounts: receiptDetails.discounts || 0,
+      invoice: receiptDetails.invoiceNumber || "",
+      receipt: receiptPasteText || "",
+      receiptFile: "Pasted receipt",
+      notes: `Imported receipt for ${receiptDetails.orderNumber || "purchase"}`,
+      attachedGiftCards: cards.map((card) => card.id),
+      sourceType: "paste-receipt",
+      sourceName: "Paste import",
+      sourceKey: createId("receipt"),
+      createdAt: new Date().toISOString(),
+      confidenceScore: 1,
+      currency: receiptDetails.currency || "USD",
+      numberOfCards: cards.length,
+      totalFaceValue: cards.reduce((sum, card) => sum + Number(card.faceValue || 0), 0),
+      averageCost: cards.length ? cards.reduce((sum, card) => sum + Number(card.purchasePrice || 0), 0) / cards.length : 0,
+      estimatedProfit: cards.reduce((sum, card) => sum + (Number(card.faceValue || 0) - Number(card.purchasePrice || 0)), 0),
+      linkedGiftCards: cards.map((card) => card.id),
+    };
+
+    return { cards, purchaseOrder, receiptDetails };
+  }
+
+  function importFromPaste() {
+    if (!giftCardPasteText.trim() && !receiptPasteText.trim()) {
+      showToast("Paste at least one gift card row or a receipt before importing.");
+      return;
+    }
+
+    const { cards, purchaseOrder } = buildPasteImportPlan();
+    if (!cards.length && !purchaseOrder?.id) {
+      showToast("No importable content was detected.");
+      return;
+    }
+
+    const nextCards = cards.map((card) => ({
+      ...card,
+      linkedPurchaseOrder: purchaseOrder.id,
+      purchaseOrderId: purchaseOrder.id,
+      linkedReceipt: purchaseOrder.receipt || "",
+      linkedInvoice: purchaseOrder.invoice || "",
+      linkedOrder: purchaseOrder.orderId || "",
+      sourceType: "paste-csv",
+      sourceName: "Paste import",
+      notes: card.notes || `Imported from paste workflow`,
+    }));
+
+    commitGiftCards((current) => mergeDuplicateCards(Array.isArray(current) ? current : [], nextCards));
+    setPurchaseCenterItems((current) => {
+      const existing = Array.isArray(current) ? current : [];
+      return existing.some((entry) => entry.id === purchaseOrder.id) ? existing : [...existing, purchaseOrder];
+    });
+    setImportHistory((current) => [{
+      id: createId("import-history"),
+      importedAt: new Date().toISOString(),
+      supplier: purchaseOrder.supplier || "CardDepot",
+      cardsImported: nextCards.length,
+      orderNumber: purchaseOrder.orderId || "",
+      receipt: purchaseOrder.receipt || "",
+    }, ...(Array.isArray(current) ? current : []).slice(0, 9)]);
+    setGiftCardPasteText("");
+    setReceiptPasteText("");
+    setSelectedPurchaseOrderId(purchaseOrder.id);
+    setActiveTab("purchases");
+    showToast(`${nextCards.length} cards imported into 1 purchase order`);
   }
 
   async function handleImportFiles(files = [], sourceType = "upload") {
@@ -751,15 +928,22 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
 
       {showPurchaseCenter && (
         <div style={{ borderRadius: "18px", padding: "16px", border: "1px solid #e5e7eb", background: theme === "dark" ? "rgba(17,24,39,0.95)" : "rgba(255,255,255,0.9)", marginBottom: "16px" }}>
-          <h3 style={{ marginTop: 0 }}>Import workflow</h3>
-          <div style={{ display: "grid", gap: "10px" }}>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              <button onClick={() => { setImportAccept("image/*;capture=camera"); fileInputRef.current?.click(); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "none", background: "linear-gradient(135deg, #2563eb, #14b8a6)", color: "#fff", cursor: "pointer" }}>📷 Camera</button>
-              <button onClick={() => { setImportAccept(".pdf"); fileInputRef.current?.click(); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📄 PDF</button>
-              <button onClick={() => { setImportAccept(".csv,text/csv"); fileInputRef.current?.click(); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📊 CSV</button>
-              <button onClick={importFromUrl} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>🌐 Website</button>
+          <h3 style={{ marginTop: 0 }}>Paste & Import</h3>
+          <div style={{ display: "grid", gap: "12px" }}>
+            <div style={{ display: "grid", gap: "10px" }}>
+              <label style={{ fontWeight: 700 }}>Paste Gift Cards</label>
+              <textarea value={giftCardPasteText} onChange={(event) => setGiftCardPasteText(event.target.value)} placeholder={'Brand,"Face Value, in $","Card Number",PIN\nNike,$60,6060101982350833707,452767\nNike,$60,6060102232350833644,028652'} style={{ minHeight: "170px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
             </div>
-            <p style={{ margin: 0, color: "#6b7280" }}>Batch import hundreds of cards at once. OCR confidence below 90% is flagged for review, and duplicates are detected automatically.</p>
+            <div style={{ display: "grid", gap: "10px" }}>
+              <label style={{ fontWeight: 700 }}>Paste Receipt</label>
+              <textarea value={receiptPasteText} onChange={(event) => setReceiptPasteText(event.target.value)} placeholder="Supplier: CardDepot\nOrder Number: CD-1001\nPurchase Date: 2026-07-01\nInvoice: INV-1001\nTotal Paid: $180\nTaxes: $12\nFees: $3\nDiscounts: $5" style={{ minHeight: "150px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
+            </div>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <button onClick={importFromPaste} style={{ padding: "11px 14px", borderRadius: "999px", border: "none", background: "linear-gradient(135deg, #2563eb, #14b8a6)", color: "#fff", cursor: "pointer" }}>Import Everything</button>
+              <button onClick={() => { setGiftCardPasteText(""); setReceiptPasteText(""); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>Clear</button>
+              <button onClick={() => { setImportAccept("image/*;capture=camera"); fileInputRef.current?.click(); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📷 Secondary OCR</button>
+            </div>
+            <p style={{ margin: 0, color: "#6b7280" }}>Paste CardDepot CSV rows and receipt text directly. This is the primary workflow now; uploads and OCR remain secondary.</p>
           </div>
         </div>
       )}
@@ -785,6 +969,47 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {resolvedTab === "purchases" && (
+        <div style={{ borderRadius: "18px", padding: "16px", border: "1px solid #e5e7eb", background: theme === "dark" ? "rgba(17,24,39,0.95)" : "rgba(255,255,255,0.9)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+            <div>
+              <h3 style={{ margin: 0 }}>Purchase Orders</h3>
+              <p style={{ margin: "6px 0 0", color: "#6b7280" }}>Review purchase orders, receipts, and their linked gift cards.</p>
+            </div>
+          </div>
+          <div style={{ display: "grid", gap: "10px", marginTop: "12px" }}>
+            {purchaseCenterItems.length === 0 && <div style={{ color: "#6b7280" }}>No purchase orders yet.</div>}
+            {purchaseCenterItems.map((order) => {
+              const linkedCards = normalizedGiftCards.filter((card) => card.linkedPurchaseOrder === order.id || card.purchaseOrderId === order.id || (card.linkedOrder || "") === (order.orderId || ""));
+              const isSelected = selectedPurchaseOrderId === order.id;
+              return (
+                <div key={order.id} onClick={() => setSelectedPurchaseOrderId(order.id)} style={{ border: isSelected ? "2px solid #2563eb" : "1px solid #e5e7eb", borderRadius: "14px", padding: "12px", background: theme === "dark" ? "rgba(15,23,42,0.9)" : "#ffffff", cursor: "pointer" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <strong>{order.supplier || "Purchase Order"}</strong>
+                    <span style={{ color: "#6b7280", fontSize: "13px" }}>{order.orderId || "No order number"}</span>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "8px", marginTop: "8px" }}>
+                    <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Purchase date</div><div>{order.purchaseDate || order.date || "—"}</div></div>
+                    <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Total paid</div><div>{money(order.totalCost || 0, order.currency || "USD")}</div></div>
+                    <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Cards</div><div>{linkedCards.length}</div></div>
+                    <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Invoice</div><div>{order.invoice || "—"}</div></div>
+                  </div>
+                  {isSelected && (
+                    <div style={{ marginTop: "10px", borderTop: "1px solid #e5e7eb", paddingTop: "10px" }}>
+                      <div style={{ display: "grid", gap: "8px" }}>
+                        <div><strong>Receipt</strong><div style={{ whiteSpace: "pre-wrap", marginTop: "4px", color: "#6b7280", fontSize: "13px" }}>{order.receipt || "No receipt text available."}</div></div>
+                        <div><strong>Taxes / Fees / Discounts</strong><div style={{ marginTop: "4px", color: "#6b7280", fontSize: "13px" }}>{money(order.taxes || 0, order.currency || "USD")} taxes • {money(order.fees || 0, order.currency || "USD")} fees • {money(order.discounts || 0, order.currency || "USD")} discounts</div></div>
+                        <div><strong>Linked gift cards</strong><div style={{ marginTop: "4px", display: "grid", gap: "6px" }}>{linkedCards.length === 0 ? <div style={{ color: "#6b7280" }}>No linked gift cards.</div> : linkedCards.map((card) => <div key={card.id} style={{ border: "1px solid #e5e7eb", borderRadius: "10px", padding: "8px" }}>{card.merchant} • {card.cardNumberMasked || card.cardNumber || "—"}</div>)}</div></div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -894,6 +1119,33 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
               <div key={merchant} style={{ display: "flex", justifyContent: "space-between", marginTop: "6px" }}>
                 <span>{merchant}</span>
                 <strong>{normalizedGiftCards.filter((card) => card.merchant === merchant).length}</strong>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {resolvedTab === "imports" && (
+        <div style={{ borderRadius: "18px", padding: "16px", border: "1px solid #e5e7eb", background: theme === "dark" ? "rgba(17,24,39,0.95)" : "rgba(255,255,255,0.9)", marginTop: "16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+            <div>
+              <h3 style={{ margin: 0 }}>Import History</h3>
+              <p style={{ margin: "6px 0 0", color: "#6b7280" }}>Track the latest paste-driven imports.</p>
+            </div>
+          </div>
+          <div style={{ display: "grid", gap: "10px", marginTop: "12px" }}>
+            {importHistory.length === 0 && <div style={{ color: "#6b7280" }}>No import history yet.</div>}
+            {importHistory.map((entry) => (
+              <div key={entry.id} style={{ border: "1px solid #e5e7eb", borderRadius: "12px", padding: "12px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <strong>{entry.supplier || "CardDepot"}</strong>
+                  <span style={{ color: "#6b7280", fontSize: "13px" }}>{new Date(entry.importedAt).toLocaleString()}</span>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "8px", marginTop: "8px" }}>
+                  <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Cards imported</div><div>{entry.cardsImported}</div></div>
+                  <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Order number</div><div>{entry.orderNumber || "—"}</div></div>
+                  <div><div style={{ fontSize: "12px", color: "#6b7280" }}>Receipt</div><div>{entry.receipt ? entry.receipt.slice(0, 36) + (entry.receipt.length > 36 ? "…" : "") : "—"}</div></div>
+                </div>
               </div>
             ))}
           </div>
