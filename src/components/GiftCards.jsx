@@ -243,6 +243,90 @@ function parseGiftCardRows(text = "") {
     .filter((row) => row.cardNumber || row.pin || row.faceValue || row.merchant || row.brand);
 }
 
+function normalizeText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function buildFingerprint(card = {}) {
+  const fields = [
+    card.cardNumber,
+    card.pin,
+    card.barcode,
+    card.qrCode,
+    card.orderNumber,
+    card.invoiceNumber,
+    card.receipt,
+    card.supplier,
+    card.purchaseDate,
+    card.merchant,
+    card.brand,
+  ];
+  return fields.map((field) => normalizeText(field)).join("|");
+}
+
+function hasDuplicateSignature(candidate, existing) {
+  if (!candidate || !existing) return false;
+  const candidateFingerprint = buildFingerprint(candidate);
+  const existingFingerprint = buildFingerprint(existing);
+  if (candidateFingerprint && existingFingerprint && candidateFingerprint === existingFingerprint) return true;
+  const compareFields = ["cardNumber", "pin", "barcode", "qrCode", "orderNumber", "invoiceNumber", "supplier", "purchaseDate"];
+  return compareFields.some((field) => {
+    const first = normalizeText(candidate[field]);
+    const second = normalizeText(existing[field]);
+    return Boolean(first && second && first === second);
+  });
+}
+
+function parseOrderNotes(text = "") {
+  const rawText = String(text || "");
+  const website = rawText.match(/https?:\/\/[^\s]+/i)?.[0] || rawText.match(/website[:\s]+([^\n]+)/i)?.[1] || "";
+  const email = rawText.match(/email[:\s]+([^\n]+)/i)?.[1] || "";
+  const tracking = rawText.match(/tracking[:\s]+([^\n]+)/i)?.[1] || "";
+  const internalNotes = rawText
+    .split(/\n/)
+    .filter((line) => line.trim())
+    .filter((line) => !/website|email|tracking/i.test(line))
+    .join("\n")
+    .trim();
+  return { website, email, tracking, internalNotes };
+}
+
+function analyzeImportPlan(plan = {}, existingCards = []) {
+  const cards = Array.isArray(plan?.cards) ? plan.cards : [];
+  const duplicates = [];
+  const candidateCards = cards.map((card, index) => {
+    const existingMatch = existingCards.find((entry) => hasDuplicateSignature(card, entry));
+    if (existingMatch) {
+      duplicates.push({
+        index,
+        card,
+        existingCard: existingMatch,
+      });
+    }
+    return card;
+  });
+
+  const orderNumbers = [];
+  const receiptText = String(plan?.receiptDetails?.orderNumber || "");
+  const notesText = String(plan?.orderNotes || "");
+  const orderPattern = /order(?:\s*number|\s*id)?[:#\s-]*([A-Za-z0-9-]+)/gi;
+  [...receiptText.matchAll(orderPattern)].forEach((match) => {
+    if (match[1]) orderNumbers.push(match[1]);
+  });
+  [...notesText.matchAll(orderPattern)].forEach((match) => {
+    if (match[1] && !orderNumbers.includes(match[1])) orderNumbers.push(match[1]);
+  });
+  const uniqueOrders = Array.from(new Set(orderNumbers.filter(Boolean)));
+  return {
+    cards: candidateCards,
+    duplicates,
+    duplicateCount: duplicates.length,
+    multipleOrdersDetected: uniqueOrders.length > 1,
+    detectedOrders: uniqueOrders,
+    needsConfirmation: duplicates.length > 0 || uniqueOrders.length > 1,
+  };
+}
+
 export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards: setControlledGiftCards, onGiftCardPurchase, activeSection = null }) {
   const [localGiftCards, setLocalGiftCards] = useState(() => loadStored(STORAGE_KEY, []));
   const [supplierProfiles, setSupplierProfiles] = useState(() => loadStored(SUPPLIER_STORAGE_KEY, {}));
@@ -270,8 +354,13 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
   const [visibleCount, setVisibleCount] = useState(24);
   const [giftCardPasteText, setGiftCardPasteText] = useState("");
   const [receiptPasteText, setReceiptPasteText] = useState("");
+  const [orderNotesText, setOrderNotesText] = useState("");
   const [importHistory, setImportHistory] = useState(() => loadStored(IMPORT_HISTORY_STORAGE_KEY, []));
   const [selectedPurchaseOrderId, setSelectedPurchaseOrderId] = useState(null);
+  const [pendingPasteImport, setPendingPasteImport] = useState(null);
+  const [duplicateDecisions, setDuplicateDecisions] = useState({});
+  const [multipleOrderDecision, setMultipleOrderDecision] = useState("merge");
+  const [contextMenuCardId, setContextMenuCardId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
   const [importAccept, setImportAccept] = useState(".pdf,.png,.jpg,.jpeg,.webp,.gif,.csv,.txt");
   const fileInputRef = useRef(null);
@@ -557,12 +646,14 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
     }));
 
     const receiptDetails = parseReceiptDetails(receiptPasteText);
+    const orderNotes = parseOrderNotes(orderNotesText);
     const purchaseOrder = {
       id: createId("purchase-order"),
       supplier: receiptDetails.supplier || "CardDepot",
       orderId: receiptDetails.orderNumber || "",
       purchaseDate: receiptDetails.purchaseDate || "",
       date: receiptDetails.purchaseDate || new Date().toISOString().slice(0, 10),
+      subtotal: receiptDetails.totalPaid || 0,
       totalCost: receiptDetails.totalPaid || 0,
       taxes: receiptDetails.taxes || 0,
       fees: receiptDetails.fees || 0,
@@ -570,7 +661,10 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
       invoice: receiptDetails.invoiceNumber || "",
       receipt: receiptPasteText || "",
       receiptFile: "Pasted receipt",
-      notes: `Imported receipt for ${receiptDetails.orderNumber || "purchase"}`,
+      notes: orderNotes.internalNotes || `Imported receipt for ${receiptDetails.orderNumber || "purchase"}`,
+      website: orderNotes.website || "",
+      email: orderNotes.email || "",
+      tracking: orderNotes.tracking || "",
       attachedGiftCards: cards.map((card) => card.id),
       sourceType: "paste-receipt",
       sourceName: "Paste import",
@@ -580,12 +674,13 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
       currency: receiptDetails.currency || "USD",
       numberOfCards: cards.length,
       totalFaceValue: cards.reduce((sum, card) => sum + Number(card.faceValue || 0), 0),
+      purchaseCost: cards.reduce((sum, card) => sum + Number(card.purchasePrice || 0), 0),
       averageCost: cards.length ? cards.reduce((sum, card) => sum + Number(card.purchasePrice || 0), 0) / cards.length : 0,
       estimatedProfit: cards.reduce((sum, card) => sum + (Number(card.faceValue || 0) - Number(card.purchasePrice || 0)), 0),
       linkedGiftCards: cards.map((card) => card.id),
     };
 
-    return { cards, purchaseOrder, receiptDetails };
+    return { cards, purchaseOrder, receiptDetails, orderNotes };
   }
 
   function importFromPaste() {
@@ -594,40 +689,83 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
       return;
     }
 
-    const { cards, purchaseOrder } = buildPasteImportPlan();
+    const plan = buildPasteImportPlan();
+    const { cards, purchaseOrder } = plan;
     if (!cards.length && !purchaseOrder?.id) {
       showToast("No importable content was detected.");
       return;
     }
 
-    const nextCards = cards.map((card) => ({
-      ...card,
-      linkedPurchaseOrder: purchaseOrder.id,
-      purchaseOrderId: purchaseOrder.id,
-      linkedReceipt: purchaseOrder.receipt || "",
-      linkedInvoice: purchaseOrder.invoice || "",
-      linkedOrder: purchaseOrder.orderId || "",
-      sourceType: "paste-csv",
-      sourceName: "Paste import",
-      notes: card.notes || `Imported from paste workflow`,
-    }));
+    const analysis = analyzeImportPlan({ ...plan, cards }, normalizedGiftCards);
+    setPendingPasteImport({
+      ...plan,
+      analysis,
+      purchaseOrder: {
+        ...purchaseOrder,
+        cards: cards.map((card) => ({ ...card, linkedPurchaseOrder: purchaseOrder.id, purchaseOrderId: purchaseOrder.id })),
+      },
+    });
+    setDuplicateDecisions({});
+    setMultipleOrderDecision("merge");
+    showToast(analysis.needsConfirmation ? "Duplicate or multi-order details detected. Review before saving." : "Ready to import");
+  }
+
+  function confirmPasteImport() {
+    if (!pendingPasteImport) return;
+    const { cards, purchaseOrder, analysis } = pendingPasteImport;
+    const nextCards = cards.map((card, index) => {
+      const decision = duplicateDecisions[index] || "skip";
+      if (decision === "skip") return null;
+      const nextCard = {
+        ...card,
+        linkedPurchaseOrder: purchaseOrder.id,
+        purchaseOrderId: purchaseOrder.id,
+        linkedReceipt: purchaseOrder.receipt || "",
+        linkedInvoice: purchaseOrder.invoice || "",
+        linkedOrder: purchaseOrder.orderId || "",
+        sourceType: "paste-csv",
+        sourceName: "Paste import",
+        notes: card.notes || `Imported from paste workflow`,
+      };
+      return nextCard;
+    }).filter(Boolean);
+
+    if (!nextCards.length) {
+      showToast("No cards were imported after review");
+      setPendingPasteImport(null);
+      return;
+    }
+
+    const nextPurchaseOrder = {
+      ...purchaseOrder,
+      attachedGiftCards: nextCards.map((card) => card.id),
+      linkedGiftCards: nextCards.map((card) => card.id),
+      numberOfCards: nextCards.length,
+      totalFaceValue: nextCards.reduce((sum, card) => sum + Number(card.faceValue || 0), 0),
+      purchaseCost: nextCards.reduce((sum, card) => sum + Number(card.purchasePrice || 0), 0),
+      estimatedProfit: nextCards.reduce((sum, card) => sum + (Number(card.faceValue || 0) - Number(card.purchasePrice || 0)), 0),
+    };
 
     commitGiftCards((current) => mergeDuplicateCards(Array.isArray(current) ? current : [], nextCards));
     setPurchaseCenterItems((current) => {
       const existing = Array.isArray(current) ? current : [];
-      return existing.some((entry) => entry.id === purchaseOrder.id) ? existing : [...existing, purchaseOrder];
+      return existing.some((entry) => entry.id === nextPurchaseOrder.id) ? existing : [...existing, nextPurchaseOrder];
     });
     setImportHistory((current) => [{
       id: createId("import-history"),
       importedAt: new Date().toISOString(),
-      supplier: purchaseOrder.supplier || "CardDepot",
+      supplier: nextPurchaseOrder.supplier || "CardDepot",
       cardsImported: nextCards.length,
-      orderNumber: purchaseOrder.orderId || "",
-      receipt: purchaseOrder.receipt || "",
+      duplicates: analysis.duplicateCount || 0,
+      orderNumber: nextPurchaseOrder.orderId || "",
+      receipt: nextPurchaseOrder.receipt || "",
+      status: analysis.needsConfirmation ? "Review complete" : "Imported",
     }, ...(Array.isArray(current) ? current : []).slice(0, 9)]);
     setGiftCardPasteText("");
     setReceiptPasteText("");
-    setSelectedPurchaseOrderId(purchaseOrder.id);
+    setOrderNotesText("");
+    setSelectedPurchaseOrderId(nextPurchaseOrder.id);
+    setPendingPasteImport(null);
     setActiveTab("purchases");
     showToast(`${nextCards.length} cards imported into 1 purchase order`);
   }
@@ -900,6 +1038,60 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
         </div>
       )}
 
+      {pendingPasteImport && (
+        <div style={{ borderRadius: "18px", padding: "16px", border: "1px solid #e5e7eb", background: theme === "dark" ? "rgba(17,24,39,0.95)" : "rgba(255,255,255,0.95)", marginBottom: "16px", boxShadow: "0 14px 46px rgba(0,0,0,0.12)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <div>
+              <h3 style={{ margin: 0 }}>Import Review</h3>
+              <p style={{ margin: "6px 0 0", color: "#6b7280" }}>Confirm duplicates and multi-order details before saving.</p>
+            </div>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <button onClick={confirmPasteImport} style={{ padding: "10px 14px", borderRadius: "999px", border: "none", background: "#2563eb", color: "#fff", cursor: "pointer" }}>Confirm Import</button>
+              <button onClick={() => setPendingPasteImport(null)} style={{ padding: "10px 14px", borderRadius: "999px", border: "1px solid #e5e7eb", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>Cancel</button>
+            </div>
+          </div>
+          <div style={{ display: "grid", gap: "10px", marginTop: "12px" }}>
+            <div style={{ display: "grid", gap: "8px" }}>
+              <strong>New Cards</strong>
+              <div style={{ display: "grid", gap: "8px" }}>
+                {pendingPasteImport.analysis.cards.map((card, index) => {
+                  const decision = duplicateDecisions[index] || "skip";
+                  const isDuplicate = pendingPasteImport.analysis.duplicates.some((entry) => entry.index === index);
+                  return (
+                    <div key={`${card.id}-${index}`} style={{ border: "1px solid #e5e7eb", borderRadius: "12px", padding: "10px", background: isDuplicate ? "rgba(245, 158, 11, 0.1)" : "transparent" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                        <div>
+                          <strong>{card.merchant || "Unknown merchant"}</strong>
+                          <div style={{ color: "#6b7280", fontSize: "13px" }}>{card.cardNumber || "No card number"}{card.pin ? ` • ${card.pin}` : ""}</div>
+                        </div>
+                        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                          {isDuplicate ? <span style={{ color: "#d97706", fontWeight: 700 }}>⚠ Duplicate</span> : <span style={{ color: "#16a34a", fontWeight: 700 }}>✓ New</span>}
+                          <select value={decision} onChange={(event) => setDuplicateDecisions((current) => ({ ...current, [index]: event.target.value }))} style={{ padding: "8px 10px", borderRadius: "10px", border: "1px solid #e5e7eb" }}>
+                            <option value="skip">Skip Duplicate</option>
+                            <option value="replace">Replace Existing</option>
+                            <option value="merge">Merge Existing</option>
+                            <option value="create">Create New</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div style={{ display: "grid", gap: "8px" }}>
+              <strong>Order Handling</strong>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: "6px" }}><input type="radio" checked={multipleOrderDecision === "merge"} onChange={() => setMultipleOrderDecision("merge")} /> Merge</label>
+                <label style={{ display: "flex", alignItems: "center", gap: "6px" }}><input type="radio" checked={multipleOrderDecision === "split"} onChange={() => setMultipleOrderDecision("split")} /> Split into separate purchase orders</label>
+                <label style={{ display: "flex", alignItems: "center", gap: "6px" }}><input type="radio" checked={multipleOrderDecision === "cancel"} onChange={() => setMultipleOrderDecision("cancel")} /> Cancel import</label>
+              </div>
+              {pendingPasteImport.analysis.multipleOrdersDetected && <div style={{ color: "#d97706" }}>Multiple order references detected: {pendingPasteImport.analysis.detectedOrders.join(", ")}</div>}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "18px" }}>
         {tabOptions.map((tab) => (
           <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{ padding: "10px 14px", borderRadius: "999px", border: resolvedTab === tab.id ? "none" : "1px solid #e5e7eb", background: resolvedTab === tab.id ? "#111827" : theme === "dark" ? "#0f172a" : "#ffffff", color: resolvedTab === tab.id ? "#fff" : theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>{tab.label}</button>
@@ -928,22 +1120,29 @@ export default function GiftCards({ giftCards: controlledGiftCards, setGiftCards
 
       {showPurchaseCenter && (
         <div style={{ borderRadius: "18px", padding: "16px", border: "1px solid #e5e7eb", background: theme === "dark" ? "rgba(17,24,39,0.95)" : "rgba(255,255,255,0.9)", marginBottom: "16px" }}>
-          <h3 style={{ marginTop: 0 }}>Paste & Import</h3>
-          <div style={{ display: "grid", gap: "12px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <h3 style={{ margin: 0 }}>Paste & Import</h3>
+            <span style={{ color: "#6b7280", fontSize: "13px" }}>Primary workflow • no OCR required</span>
+          </div>
+          <div style={{ display: "grid", gap: "12px", marginTop: "12px" }}>
             <div style={{ display: "grid", gap: "10px" }}>
               <label style={{ fontWeight: 700 }}>Paste Gift Cards</label>
-              <textarea value={giftCardPasteText} onChange={(event) => setGiftCardPasteText(event.target.value)} placeholder={'Brand,"Face Value, in $","Card Number",PIN\nNike,$60,6060101982350833707,452767\nNike,$60,6060102232350833644,028652'} style={{ minHeight: "170px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
+              <textarea value={giftCardPasteText} onChange={(event) => setGiftCardPasteText(event.target.value)} placeholder={'Brand,"Face Value, in $","Card Number",PIN\nNike,$60,6060101982350833707,452767\nNike,$60,6060102232350833644,028652\nNike,$60,6060102912350833670,992057'} style={{ minHeight: "170px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
             </div>
             <div style={{ display: "grid", gap: "10px" }}>
               <label style={{ fontWeight: 700 }}>Paste Receipt</label>
-              <textarea value={receiptPasteText} onChange={(event) => setReceiptPasteText(event.target.value)} placeholder="Supplier: CardDepot\nOrder Number: CD-1001\nPurchase Date: 2026-07-01\nInvoice: INV-1001\nTotal Paid: $180\nTaxes: $12\nFees: $3\nDiscounts: $5" style={{ minHeight: "150px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
+              <textarea value={receiptPasteText} onChange={(event) => setReceiptPasteText(event.target.value)} placeholder="Supplier: CardDepot\nOrder Number: CD-1001\nPurchase Date: 2026-07-01\nInvoice: INV-1001\nSubtotal: $180\nTaxes: $12\nFees: $3\nDiscount: $5\nTotal Paid: $190\nCurrency: USD" style={{ minHeight: "150px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
+            </div>
+            <div style={{ display: "grid", gap: "10px" }}>
+              <label style={{ fontWeight: 700 }}>Paste Order Notes</label>
+              <textarea value={orderNotesText} onChange={(event) => setOrderNotesText(event.target.value)} placeholder="Website: https://example.com\nEmail: buyer@example.com\nTracking: 1Z999\nInternal Notes: Priority order" style={{ minHeight: "120px", padding: "12px", borderRadius: "12px", border: "1px solid #e5e7eb", fontFamily: "monospace" }} />
             </div>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
               <button onClick={importFromPaste} style={{ padding: "11px 14px", borderRadius: "999px", border: "none", background: "linear-gradient(135deg, #2563eb, #14b8a6)", color: "#fff", cursor: "pointer" }}>Import Everything</button>
-              <button onClick={() => { setGiftCardPasteText(""); setReceiptPasteText(""); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>Clear</button>
-              <button onClick={() => { setImportAccept("image/*;capture=camera"); fileInputRef.current?.click(); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>📷 Secondary OCR</button>
+              <button onClick={() => { setGiftCardPasteText(""); setReceiptPasteText(""); setOrderNotesText(""); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>Clear</button>
+              <button onClick={() => { setImportAccept("image/*;capture=camera"); fileInputRef.current?.click(); }} style={{ padding: "11px 14px", borderRadius: "999px", border: "1px solid #d1d5db", background: theme === "dark" ? "#111827" : "#ffffff", color: theme === "dark" ? "#f9fafb" : "#111827", cursor: "pointer" }}>Advanced Import</button>
             </div>
-            <p style={{ margin: 0, color: "#6b7280" }}>Paste CardDepot CSV rows and receipt text directly. This is the primary workflow now; uploads and OCR remain secondary.</p>
+            <p style={{ margin: 0, color: "#6b7280" }}>Paste CardDepot CSV, receipt text, and optional order notes. Review duplicates and multi-order data before saving anything.</p>
           </div>
         </div>
       )}
